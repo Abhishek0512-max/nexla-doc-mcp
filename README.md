@@ -17,14 +17,27 @@ A local **Model Context Protocol (MCP)** server that ingests a set of PDF docume
 
 ---
 
+## Assignment requirements coverage
+
+| Requirement | Where it's implemented |
+|---|---|
+| Ingest all provided PDFs | `services/ingestion/` (`make ingest`) |
+| ≥1 MCP tool for grounded Q&A | `query_documents` (+ `list_documents`, `get_document_section`) |
+| Multi-document awareness | single Chroma collection; retrieval ranks across all sources |
+| Source attribution | every `Citation` carries document, page, section (best-effort), snippet, score |
+| MCP protocol compliance, runs locally | FastMCP server over stdio (`make run`) |
+| Demonstrably working Q&A | MCP demo checklist + example interaction log below |
+
+---
+
 ## Architecture
 
 The codebase is layered so each module has exactly one job. The runtime request path is **routes → handlers → services → repo → vector store**, and nothing above the repo ever touches Chroma directly.
 
 ```
 app/
-├── server.py                     # MCP entrypoint: FastMCP instance, registers tools, runs (stdio)
-├── routes/documents.py           # thin MCP tool layer: schema + delegate to handlers
+├── server.py                     # MCP entrypoint: creates the FastMCP instance, calls register(), runs (stdio)
+├── routes/documents.py           # thin MCP tool layer: defines tools via register(mcp), delegates to handlers
 ├── handlers/documents.py         # per-tool orchestration (query = retrieve + synthesize)
 ├── services/
 │   ├── ingestion/
@@ -106,7 +119,6 @@ make test
 ```bash
 make eval
 ```
-
 This runs a small golden retrieval set against the indexed Chroma collection and reports `document_recall@5`, `page_recall@5`, `mrr@5`, and exact-source pass rate. It uses the same retrieval path as `query_documents`, so a valid `OPENAI_API_KEY` is required for query embeddings.
 
 ---
@@ -121,7 +133,7 @@ poetry run fastmcp dev app/server.py
 **Quick MCP demo checklist:**
 
 1. Open the Inspector and confirm it discovers exactly three tools: `query_documents`, `list_documents`, and `get_document_section`.
-2. Inspect `query_documents` and verify the advertised schema includes `question` (`minLength=1`) and optional `top_k` (`1..20`), plus read-only / non-destructive annotations.
+2. Inspect `query_documents` and verify the advertised schema includes `question` (`minLength=1`) and optional `top_k` (`1..20`), plus read-only / non-destructive behavior.
 3. Call `list_documents` to verify all 5 PDFs are indexed.
 4. Call `query_documents` with `Which papers in the corpus are from Facebook AI Research, and what problems do they address?` to demonstrate multi-document retrieval with citations.
 5. Call `get_document_section` with `document="W18-4401.pdf", page=3` to show page-level source inspection.
@@ -171,49 +183,54 @@ Fetch the raw indexed text of one page of one document, to verify or expand on a
 ## Design Decisions & Trade-offs
 
 - **FastMCP framework.** Decorator-based tools generate spec-compliant schemas automatically, so effort goes into logic, not JSON-RPC plumbing.
+- **ChromaDB on disk.** Zero-infrastructure, persists across restarts, native metadata storage/filtering, and more than sufficient for a corpus of this size. Deliberately *not* Postgres/pgvector or a hosted vector DB — this is a local take-home, and the repo abstraction makes swapping the store a one-file change (see Production Considerations).
+- **OpenAI `text-embedding-3-small` embeddings.** High-quality semantic retrieval and the simplest bring-your-own-vectors path into Chroma. Trade-off: the key is needed at query time (see Setup).
+- **Hybrid retrieval (dense + BM25-style lexical, fused).** Dense vectors alone blur exact tokens — paper names, dataset names like `WinoMT` / `CoNLL-2003`, and affiliations — so a lexical signal is added and weighted slightly higher (`VECTOR_WEIGHT=0.4`, `LEXICAL_WEIGHT=0.6`) for this name-heavy corpus. The pipeline over-retrieves (80 candidates) and fuses/reranks down to the final `TOP_K`. This was a deliberate upgrade from a dense-only first pass after reading Anthropic's [Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval) write-up; I added the highest-leverage pieces that fit the time box and documented the one I skipped (LLM-generated contextual chunks) as future work, because it would require a re-ingestion path and extra generation cost.
 - **Hybrid answer synthesis.** When a key is configured the server composes a grounded, inline-cited answer; with synthesis off — or on any LLM/network failure — it returns the top ranked, still-cited passages. This satisfies "the server returns grounded answers" while never crashing a tool call.
-- **OpenAI embeddings, persisted locally in Chroma.** Simplest high-quality semantic retrieval path; the documented consequence is that the key is needed at query time (see Setup).
-- **Retrieval quality iteration.** The first pass used dense vector top-k only. After reading Anthropic's [Contextual Retrieval](https://www.anthropic.com/engineering/contextual-retrieval) write-up, I added the highest-leverage pieces that fit this time box: over-retrieve dense candidates, add BM25-style lexical candidates for exact terms / dataset names, and fuse/rerank down to the final `TOP_K`. The tuned local defaults retrieve 80 candidates and weight lexical matches slightly higher (`VECTOR_WEIGHT=0.4`, `LEXICAL_WEIGHT=0.6`) because this corpus contains many exact paper names, dataset names, and affiliations. I did not add LLM-generated contextual chunk prefixes because that would require a re-ingestion path and extra generation cost; it is listed below as future work.
-- **Evaluation as a quality gate.** Rather than judging generated prose by eye only, `evals/retrieval_golden.jsonl` defines known question → expected source labels. `make eval` measures retrieval before synthesis, which isolates the most important failure mode: if the right evidence is not retrieved, the answer cannot be grounded.
+- **PyMuPDF text extraction.** Fast and reliable for these text-based PDFs; deliberately text-only (richer extraction is in Future Work).
 - **Page-aware chunking.** A chunk never crosses a page boundary, so every chunk carries an exact page number — attribution is structural, not best-effort.
-- **ChromaDB on disk.** Zero-infrastructure, persists across restarts, native metadata storage/filtering, and more than sufficient for a corpus of this size. The repo isolates it, so swapping to FAISS/Qdrant would touch one file.
 - **Single collection, no per-document filter.** Multi-document awareness falls out for free — retrieval ranks across all sources at once.
 - **Thin tool surface (3 tools).** Enough to show protocol fluency without flooding the agent's context with rarely-used tools.
+- **Evaluation as a quality gate.** Retrieval is measured against a golden set rather than judged by eye (see Evaluation & Quality Gates).
 
 ---
 
 ## Known Limitations & Future Work
 
+These are improvements to the **core RAG quality** of what's built (extraction, retrieval, evaluation depth).
+
+- **Extraction is text-only.** PyMuPDF pulls text but is not very accurate on tables, figures, signatures, and multi-column layout. Next steps: layout-/table-aware parsing, OCR for scanned pages, and a **multimodal** path that extracts figures and stores image (or text+image) embeddings alongside the text. Enrich per-chunk metadata (section IDs, table/figure references, source coordinates) so attribution and filtering get sharper.
+- **Retrieval can go further.** The current reranker is deterministic weighted fusion over dense and lexical candidates. A true **cross-encoder reranker** (Cohere rerank or a local BGE reranker) would lift harder semantic matches at the cost of another model dependency. **Contextual chunks** — Anthropic's pattern of prepending a generated chunk-specific context before embedding/BM25 indexing — is the next quality step. For multi-hop or global ("across all papers") questions, **Graph RAG** (an entity/knowledge graph plus community summaries) would beat flat top-k.
 - **Section detection is best-effort.** A lightweight heuristic occasionally mis-tags a short Title-Case line (e.g., an author name) as a section heading. **Page numbers are the reliable attribution anchor**, so answers and citations are unaffected. Tightening to numbered-headings-only, or dropping the `section` field entirely, are both safe improvements.
-- **Local reranking only.** The current reranker is deterministic weighted fusion over dense and lexical candidates. A true cross-encoder / hosted reranker (for example Cohere rerank or a local BGE reranker) would likely improve harder semantic matches, at the cost of another model dependency.
-- **No contextual chunk generation.** Anthropic's full contextual retrieval pattern prepends generated chunk-specific context before embedding and BM25 indexing. This implementation keeps ingestion simple and documents that as the next retrieval-quality step.
-- **API embeddings require a key at query time** (see Setup). A local-embedding mode would enable fully offline operation.
-- **No OCR.** Text-based PDFs are assumed; scanned/image-only pages would need an OCR pass before ingestion.
-
----
-
-## Production Considerations
-
-These were considered but intentionally kept out of the 3-4 hour local take-home scope:
-
-- **Cross-encoder reranking.** Retrieve a wide dense/lexical candidate set, then score each query/chunk pair with a model trained for relevance.
-- **Contextual chunks.** Generate a short description of each chunk in its document context and prepend it before embedding/indexing.
-- **Incremental ingestion.** Track file hashes and re-index only changed PDFs instead of rebuilding the whole local collection.
-- **OCR and table extraction.** Add OCR for scanned PDFs and table-aware parsing for structured document regions.
-- **Remote MCP hardening.** If this moved from local stdio to HTTP, add OAuth/scopes, audit logs with redaction, rate limits, quotas, and human approval for write-capable tools.
-- **Richer observability and generation evals.** Log retrieval scores/latency/cost, promote failed real queries into the golden set, and add RAGAS/LLM-as-judge checks for faithfulness, answer relevance, and citation coverage.
+- **API embeddings require a key at query time** (see Setup). A local-embedding mode (sentence-transformers) would enable fully offline operation.
 
 ---
 
 ## Evaluation & Quality Gates
 
-The eval harness is intentionally component-level:
+The eval harness is intentionally **component-level** — it measures retrieval *before* synthesis, because if the right evidence isn't retrieved, the answer cannot be grounded.
 
-- **Dataset:** `evals/retrieval_golden.jsonl` contains 10 hand-labeled questions with expected source documents/pages from the indexed PDFs.
-- **Runner:** `make eval` calls the same retrieval service used by the MCP tool.
+- **Dataset:** `evals/retrieval_golden.jsonl` — hand-labeled questions with expected source documents/pages from the indexed PDFs.
+- **Runner:** `make eval` calls the same retrieval service the MCP tool uses, so the eval exercises the real path.
 - **Metrics:** document recall@k, page recall@k, mean reciprocal rank (MRR), and exact-source pass rate.
-- **Current result:** with the indexed 5-paper corpus and tuned hybrid retrieval defaults, the golden set reports `document_recall@5=1.00`, `page_recall@5=1.00`, `mrr@5=1.00`, and `exact_source_pass_rate@5=1.00`.
-- **Scope:** this measures whether retrieval finds the right evidence before answer synthesis. In production, I would add generation-level faithfulness / citation coverage checks, but retrieval is the first gate because synthesis cannot recover from missing evidence.
+- **Current result:** on the indexed 5-paper corpus with tuned hybrid defaults, the golden set reports `document_recall@5=1.00`, `page_recall@5=1.00`, `mrr@5=1.00`, and `exact_source_pass_rate@5=1.00`.
+- **Reading the score honestly.** With a small, well-separated 5-paper corpus and distinctive questions, near-perfect retrieval is *expected*. This is best read as a **regression smoke-gate** — it catches a retrieval regression on any code change — not as a benchmark of retrieval difficulty.
+- **Next step — make the eval discriminating.** Add adversarial, paraphrased, and shared-keyword questions (where a term appears in several papers) so the metrics drop below 1.00 and the harness actually separates good retrieval from lucky retrieval.
+- **Next step — evaluate the whole RAG system.** Extend beyond retrieval to score retrieval + augmentation + generation together, using **golden answers** plus **LLM-as-judge** for faithfulness, answer relevance, and citation coverage, and track **latency and cost** per stage as first-class metrics. Guardrail: track quality, never optimize prompts toward the metric.
+
+---
+
+## Production Considerations
+
+These were considered but intentionally kept out of the 3–4 hour local take-home scope. Where Future Work makes the *core system* better, these make it *deployable at scale*.
+
+- **Storage & ingestion at scale.** Move embedded Chroma to a served/managed vector DB (Qdrant) or pgvector, decoupled from the server. Make ingestion **incremental** (hash-based re-index of only changed PDFs) and run it as an async worker rather than in the serving path, so large or growing PDF corpora index without blocking queries.
+- **MCP scaling.** Stateless Streamable HTTP behind a load balancer, a shared vector store, and a separate ingestion worker → horizontal scale with no sticky sessions.
+- **MCP observability.** Log every tool call (structured logs or a `tool_calls` table): tool name, argument shape, latency, cost, and result size — so production usage is monitorable and slow/expensive calls are visible.
+- **Call-intent capture.** MCP surfaces *what* tool ran with *what* arguments, but not *why*. An optional `intent` string the calling agent populates supplies that missing signal for debugging, analytics, and routing (it relies on the client filling it honestly, but even best-effort intent is valuable).
+- **Context hygiene & response shaping.** Watch tool payload sizes so a single call doesn't flood the agent's context, and support caller-specified **field include/exclude** so the agent can request only the keys it needs from a rich structured response instead of the full Pydantic object.
+- **Tool affordances for multi-step use.** At scale, tool naming/descriptions should also guide the agent on how to *chain* tools toward a multi-step goal (potentially with a routing/planner layer). A 3-tool local server doesn't need this, but it's the right direction for a larger tool surface.
+- **Remote hardening.** If this moved from local stdio to HTTP: OAuth 2.1 / scopes, audit logs with source-side redaction, rate limits and quotas, and human approval for any write-capable tool.
 
 ---
 
@@ -254,7 +271,7 @@ Captured from local runs against the indexed assignment PDFs.
 
 ---
 
-# Vibe Coding Setup
+## Vibe Coding Setup
 
 I'd frame what I did less as "vibe coding" and more as **disciplined, AI-assisted engineering** ; The human stays the architect and owns every decision; the AI is a force multiplier for research, scaffolding, and execution, kept on-rails by an explicit harness. MCP and agentic RAG are new enough that there's no settled playbook, so much of the work was using AI to *discover* current practice and then exercising judgment about what to adopt.
 

@@ -254,11 +254,49 @@ Captured from local runs against the indexed assignment PDFs.
 
 ---
 
-## Vibe Coding Setup
+# Vibe Coding Setup
 
-I used Cursor as the primary AI-assisted development environment and worked **decision-first, module-by-module**:
+I'd frame what I did less as "vibe coding" and more as **disciplined, AI-assisted engineering** ; The human stays the architect and owns every decision; the AI is a force multiplier for research, scaffolding, and execution, kept on-rails by an explicit harness. MCP and agentic RAG are new enough that there's no settled playbook, so much of the work was using AI to *discover* current practice and then exercising judgment about what to adopt.
 
-- **How I directed it.** Rather than asking for a finished system, I drove every architectural call myself — MCP framework (FastMCP), answer strategy (hybrid synthesis), embeddings (OpenAI persisted in Chroma), the production-style `routes / handlers / services / repos` layout, and Poetry for dependency management. For each decision I had the assistant lay out researched options first, then I chose, then it scaffolded that one file and explained it before I moved on.
-- **What worked.** Fast, well-separated scaffolding; quick wiring of the layered architecture; and tight iteration via runtime checks after every step (`make ingest`, smoke scripts, the in-memory client).
-- **Where I overrode / corrected it.** I replaced the chunker's heading heuristic when it mis-tagged author lines as sections; I imposed my own repo structure over a flatter suggestion; and I had to correct runtime assumptions that passed static checks — notably Chroma's nested `query()` return shape and the conversion of cosine distance to similarity. The most time-consuming bug was environmental, not code: a stale `OPENAI_API_KEY` exported in my shell was shadowing `.env` (shell vars outrank dotenv), which produced confusing 401s until I isolated it.
-- **Overall view.** AI tooling is a large accelerator for boilerplate, glue code, and iterative debugging, but the engineer still owns correctness, runtime validation, edge cases, and design trade-offs. The leverage is highest when the human keeps the architectural decisions and uses the AI to execute and explain them — not the other way round.
+## A standing harness, not ad-hoc prompts
+
+I maintain project-level instruction files — `CLAUDE.md` for Claude Code, `AGENTS.md` for Codex-style agents, and Cursor rules — that encode the non-negotiables so every generation starts already aligned instead of being re-prompted each time: clear separation of concerns, typed boundaries between layers, small single-purpose functions, no dead scaffolding, and "write the unit tests alongside the code, not after." Keeping these portable means the same standards apply whichever agent I reach for.
+
+Crucially, the harness is a **living document**. When the AI repeated a mistake, I encoded the correction as a new rule rather than re-explaining it each session — so the instruction files compound over time and the same class of error stops recurring. The harness is the memory the model doesn't have.
+
+## Right tool for the cognitive task
+
+I split the work by *type of thinking*:
+
+- **Claude Code for spec and architecture** — decomposing the problem, weighing trade-offs, and researching the current state of MCP/RAG (FastMCP vs. the bundled SDK, contextual retrieval, transports, chunking strategies). Because the domain is new, this research-and-reason loop was where most of the real value lived. 
+- **Cursor for implementation** — I standardized on a single implementation surface so I could navigate the codebase, select and refactor specific spans in place, and review every diff inline. I switched models by task economics: a fast, cheap model for boilerplate and mechanical refactors, and a stronger reasoning model for architecture, tricky bugs, and spec work. One editor keeps context tight and the loop fast.
+
+I feel that claude is good at writing spec, codex for writing small clean code and cursor for targeted edits. Here I used claude+cursor mainly
+
+## Human-led decomposition, spec-first
+
+I chunked the system into phases myself — ingestion/preprocessing → chunking → embedding + retrieval → grounded synthesis → the MCP interface → tests — and ran each as the same loop: design the architecture, pressure-test the options with the AI, research what the best teams currently do, decide, implement one module, verify at runtime. The architecture spec was written down first and treated as the source of truth; the AI implemented *against* the spec and was asked to critique it, rather than inventing structure in the chat thread. The AI never set the structure; I did, then had it execute and explain so I understood every line I kept.
+
+## Treating a new domain carefully
+
+MCP and agentic RAG post-date the models' training data, so I treated the AI's knowledge as a **hypothesis, not a fact**. Anything load-bearing — transport choices, tool-schema conventions, current FastMCP APIs, retrieval techniques — I verified against primary sources (the official MCP specification, Anthropic's documentation, FastMCP's docs) before committing to it. Recognizing the knowledge-cutoff problem and routing around it was a core part of the workflow, not an afterthought.
+
+## Verify, don't trust — a gate on every generation
+
+Generated code was a draft until it passed a gate: type-checking, lint, and a runtime smoke check (`make ingest`, the in-memory client, direct calls). I treated "the static checks pass" as necessary but not sufficient — runtime correctness is a separate bar. The test suite stayed human-owned: I had the AI propose test *logic*, then reviewed and wrote the tests myself, so the safety net was never generated by the same process it was meant to catch. Generations were kept small and scoped to one module so every diff stayed reviewable and reversible.
+
+## From baseline to hardening
+
+Once the system worked end to end, I shifted to "make it production-grade." I researched and weighed security (notably prompt injection via document content), auditability, observability, agentic architecture, and latency, then prioritized deliberately rather than building everything in scope. I added an evaluation pass — measuring retrieval and answer quality — to drive refinement on accuracy, and used it alongside code cleanup to strengthen the design.
+
+## Failure modes I guarded against
+
+Working this way means knowing where AI tends to fail and watching for it. The recurring ones I actively guarded against were: **hallucinated or outdated APIs** (mitigated by primary-source verification), **confident-but-wrong runtime assumptions** (caught by the verification gate), **speculative over-engineering** (I pruned dead scaffolding the AI wanted to add), and **sycophantic agreement** with a weak idea (mitigated by asking for options and trade-offs before any code, so the model argued positions rather than rubber-stamping mine). Concrete catches included Chroma's nested `query()` return shape, the cosine-distance-to-similarity conversion, a chunker heuristic that mis-tagged author lines as section headings, and a stale `OPENAI_API_KEY` in my shell silently shadowing `.env` (shell vars outrank dotenv) — which produced confusing 401s until I isolated it. Also, the model starts performing worst when reaching context (Cursor or Claude code), I maintain a doc on side with changes and important decisions. After, it goes to 80/90% of context, I move to a new chat. 
+
+## Honest cost/benefit
+
+AI was a large net accelerator for research, boilerplate, scaffolding, and iteration — it collapsed the cost of exploring the unfamiliar MCP surface and wiring up the layered architecture. It was *not* free: the most time-consuming bug came from trusting a confident runtime assumption that passed static checks, and a few "helpful" abstractions had to be removed rather than added. The honest read is that AI shifts effort from typing toward judgment — and judgment is where the remaining work concentrates.
+
+## Overall view
+
+AI collapses the cost of research, boilerplate, and iteration, but it doesn't own the system — the engineer does. The highest leverage comes from using AI as a thinking partner for spec and a fast executor for implementation, governed by an explicit, evolving harness, while keeping decomposition, architecture, correctness, and trade-offs firmly in human hands. For a genuinely new domain like agentic MCP, that judgment — knowing which "latest and greatest" pattern actually fits the problem, and verifying it against primary sources rather than model memory — is the real differentiator, and it's what I set out to demonstrate here.

@@ -1,0 +1,41 @@
+[tool.poetry]
+package-mode = false
+
+[project]
+name = "nexla-doc-mcp"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastmcp (>=3.2,<4.0)",
+    "pymupdf (>=1.26)",
+    "chromadb (>=1.0)",
+    "openai (>=1.0)",
+    "pydantic (>=2.0)",
+    "pydantic-settings (>=2.0)",
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+ruff = "*"
+mypy = "*"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["app"]
+explicit_package_bases = true
+mypy_path = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
